@@ -4,6 +4,7 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import JSZip from 'jszip';
 
 dotenv.config();
 
@@ -212,6 +213,66 @@ app.get('/api/codebase/file', async (req, res) => {
     return res.status(err.code === 'ENOENT' ? 404 : 500).json({
       success: false,
       error: err.code === 'ENOENT' ? 'File not found' : 'Failed to read file from disk',
+    });
+  }
+});
+
+// Exports the complete current repository as a single structured ZIP archive - strictly read-only
+app.get('/api/codebase/export-zip', async (req, res) => {
+  try {
+    const rootDir = path.resolve(process.cwd());
+    const ignoredDirs = new Set(['node_modules', '.git', 'dist', '.cache', '.turbo', '.next']);
+    const zip = new JSZip();
+
+    async function packageDirectory(currentDir: string, relativeDir: string = '') {
+      const entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') && entry.name !== '.env.example' && entry.name !== '.gitignore') {
+          // Skip internal hidden dotfiles (e.g. .DS_Store)
+          continue;
+        }
+        if (ignoredDirs.has(entry.name)) {
+          continue;
+        }
+
+        const fullPath = path.join(currentDir, entry.name);
+        const relPath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+
+        if (entry.isDirectory()) {
+          await packageDirectory(fullPath, relPath);
+        } else if (entry.isFile()) {
+          // Security: never include sensitive environment variable files
+          if (relPath === '.env' || relPath.endsWith('/.env')) {
+            continue;
+          }
+          const fileData = await fs.promises.readFile(fullPath);
+          zip.file(relPath, fileData);
+        }
+      }
+    }
+
+    await packageDirectory(rootDir);
+
+    const zipBuffer = await zip.generateAsync({
+      type: 'nodebuffer',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 },
+    });
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `axon-source-${timestamp}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Length', zipBuffer.length);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+
+    return res.status(200).send(zipBuffer);
+  } catch (err: any) {
+    console.error('[Codebase] ZIP export error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to generate repository ZIP archive',
     });
   }
 });
